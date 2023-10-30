@@ -90,7 +90,13 @@ int main()
     printf("Введите строку: ");
     getline(&S, &bufferSize, stdin);  // Динамически выделяем память для строки
 
-
+    size_t length = strlen(S);
+    if (S[length - 1] == '\n')
+    {
+        S[length - 1] = '\0'; // Заменить '\n' на '\0'
+    }
+    
+    
     // Дробление на предложения
     char* delimiters = ".!?";
     int count; // кол-во предложений
