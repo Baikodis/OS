@@ -1,0 +1,239 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <math.h>
+#include <sys/wait.h>
+#include <sys/sem.h>
+#include <string.h>
+
+// Дробление строки на подстроки
+char** splitString(const char* input, char* delimiters, int* count)
+{
+    char** substrings = NULL;
+    *count = 0;
+
+    char* copy = strdup(input);  // Создаем копию строки
+    if (copy == NULL) {
+        perror("Memory allocation error");
+        return NULL;
+    }
+
+    char* token = strtok(copy, delimiters);  // Разбиваем строку на подстроки
+
+    while (token != NULL) 
+    {
+        if ((strlen(token) > 0) && (strcmp(token, "\n") != 0))
+        {
+            (*count)++;  // Увеличиваем счетчик подстрок
+
+            // Увеличиваем размер массива указателей на строки и копируем подстроку
+            substrings = realloc(substrings, (*count) * sizeof(char*));
+            if (substrings == NULL) {
+                perror("Memory allocation error");
+                free(copy);
+                return NULL;
+            }
+
+            substrings[(*count) - 1] = strdup(token); // strcpy(substrings[(*count) - 1], token);
+        }
+        token = strtok(NULL, delimiters);  // Переходим к следующей подстроке
+    }
+
+    free(copy);  // Освобождаем копию строки
+
+    return substrings;
+}
+
+
+// Поиск слова максимальной длины
+char* FindMaxLenth(char** words, int* word_count)
+{
+    int max_lenth = 0;
+    char* longer_word;
+
+    for (int i = 0; i < *word_count; i++)
+    {
+        char* current_word = words[i];
+        int current_lenth = strlen(current_word);
+
+        if (strcmp(current_word, " ") == 0)
+            continue;
+
+        if (current_lenth > max_lenth)
+        {
+            max_lenth = current_lenth;
+            longer_word = current_word;
+        }
+    }
+
+    if (max_lenth == 0)
+    {
+        return " ";
+    }
+
+    return longer_word;
+}
+
+
+pid_t pid;
+int shmid;
+char** shared_memory;
+int semid;
+
+int main()
+{
+    // Считывание строки
+    char* S = NULL;  // Указатель на буфер
+    size_t bufferSize = 0;
+    printf("Введите строку: ");
+    getline(&S, &bufferSize, stdin);  // Динамически выделяем память для строки
+
+
+    // Дробление на предложения
+    char* delimiters = ".!?";
+    int count; // кол-во предложений
+    char** substrings = splitString(S, delimiters, &count);
+
+
+    // Алгоритм процесса-родителя
+    if (substrings != NULL)
+    {
+        //Подсчет кол-ва слов в первом предложении
+        delimiters = " ,";
+        int value[count]; // кол-во слов для каждого предложения
+        char** words = splitString(substrings[0], delimiters, &value[0]);
+
+
+        // Создаем разделяемую память
+        shmid = shmget(IPC_PRIVATE, sizeof(char*) * value[0], IPC_CREAT | 0666);
+        if (shmid < 0) {
+            perror("shmget");
+            exit(1);
+        }
+
+
+        // Присоединяемся к разделяемой памяти
+        shared_memory = (char**)shmat(shmid, NULL, 0);
+        if (shared_memory == (void*)-1) {
+            perror("shmat");
+            exit(1);
+        }
+
+
+        //Помещаем слова в память
+        for (int i = 0; i < value[0]; i++)
+            shared_memory[i] = strdup(words[i]);
+
+
+        //Работа с семафорами
+        struct sembuf Plus1 = {0, 1, 0};
+        struct sembuf Minus1 = {0, -1, 0};
+        semid = semget (IPC_PRIVATE, 1, IPC_CREAT|0666);
+        if ( semid < 0 )
+        {
+            perror("semget");
+            exit(0);
+        }
+        semop( semid, &Plus1, 1);
+
+
+        //создание потомков
+        for (int i = 1; i < count; i++)
+        {
+            pid = fork();
+            if (pid == -1)
+            {
+                perror("fork");
+                exit(1);
+            } 
+
+            // алгоритм для потомков
+            else if (pid == 0)
+            {
+                char** words_ancestor = splitString(substrings[i], delimiters, &value[i]);
+
+
+                // Перебираем все слова из базы
+                for (int j = 0; j < value[0]; j++)
+                {
+                    // блокируем процессы, пока не проверим слово
+                    semop(semid, &Minus1, 1);
+            
+                    char* current = shared_memory[j]; // слово из базы
+                    //если слово уже отсутствовало в каком-то предложении
+                    if (strcmp(current, " ") == 0)
+                    {
+                        semop(semid, &Plus1, 1);
+                        continue;
+                    }
+                    
+                    short flag = 0; // есть ли слово из базы в нашем предложении
+
+                    // Сверяем каждое слово из нашего предложения со словом из базы
+                    for (int word_i = 0; word_i < value[i]; word_i++)
+                    {
+                        if (strcmp(words_ancestor[word_i], current) == 0)
+                        {
+                            flag = 1;
+                            break;
+                        }
+                    }
+                    
+
+                    // Если слово встретилось в предложении, ничего с ним не делаем
+                    if (flag) 
+                    {
+                        semop(semid, &Plus1, 1);
+                        continue;
+                    }
+                    
+
+                    // Слово не встретилось, "убираем" его из базы
+                    shared_memory[j] = strdup(" ");
+                    
+
+                    // Возобновляем доступ другим потомкам
+                    semop(semid, &Plus1, 1);
+                }
+            }
+        }
+
+        // Ждём потомков
+        for (int i=0; i < count; i++)
+        {
+            wait(NULL);
+        }
+        if (pid != 0 && pid != -1)
+        {
+            char* longer_word = FindMaxLenth(shared_memory, &value[0]);
+
+            if (strcmp(longer_word, " ") == 0)
+            {
+                printf("Подходящего слова нет \n");
+            }
+            else
+                printf("Искомое слово: %s\n", longer_word);
+            
+            // Удаляем семафор
+            if (semctl(semid, 0, IPC_RMID) == -1) {
+                perror("semctl");
+                return 1;
+            }
+
+            // Освобождаем разделяемую память и отсоединяемся от неё
+            if (shmdt(shared_memory) == -1) {
+                perror("shmdt");
+                return 1;
+            }
+
+            // Удаляем разделяемую память
+            if (shmctl(shmid, IPC_RMID, NULL) == -1) {
+                perror("shmctl");
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
